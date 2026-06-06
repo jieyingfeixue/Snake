@@ -22,6 +22,7 @@ def main():
     print("Connected %s @ 115200" % port)
     print("WASD = move, J = OK/pause/retry, K = menu (game over). Ctrl+C to quit.")
     print("2P VS: board K1-K4 = P1 (green), UART WASD = P2 (blue).")
+    print("Board also prints: [START] [SCORE] [LEVEL] [OVER] [VS_OVER] [DEMO_OVER]")
     try:
         while True:
             if msvcrt.kbhit():
