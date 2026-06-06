@@ -1,0 +1,19 @@
+# Keil output files
+*.obj
+*.lst
+*.lnp
+*.m51
+*.pbi
+*.i
+*.d
+*.crf
+*.o
+*.axf
+*.htm
+*.dep
+*.build_log.htm
+*.map
+
+# IDE files
+.idea/
+.vscode/
