@@ -18,6 +18,13 @@
 #define KEY_LEFT_PRESSED()   (GPIO_ReadInputDataBit(GPIOC, GPIO_Pin_13) == 0)
 #define KEY_RIGHT_PRESSED()  (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_0) == 0)
 
+/* Key debounce: stable press resample + post-release cooldown */
+#define KEY_DEBOUNCE_MS      45
+#define KEY_RELEASE_STABLE   3
+#define KEY_RELEASE_MS       15
+#define KEY_COOLDOWN_TICKS   8
+#define KEY4_LONG_TICKS      35
+
 /* -------------------- ??????? -------------------- */
 #define CELL_SIZE      10
 #define BOARD_X        10
@@ -193,6 +200,7 @@ static uint8_t g_key4_hold_ticks = 0;
 static uint8_t g_pause_block_ticks = 0;
 static uint8_t g_input_block_ticks = 0;
 static uint8_t g_key_click_lock = 0;
+static uint8_t g_key_cooldown_ticks = 0;
 static uint32_t g_rng_state = 1;
 static uint32_t g_rng_stir = 0;
 static uint8_t g_food_phase = 0;
@@ -202,13 +210,16 @@ static uint8_t g_score_flash = 0;
 static DieReason g_die_reason = DIE_NONE;
 
 #define KEY_CONFIRM    5
+#define KEY_ENTER      6
 
 static uint8_t g_uart_key = 0;
 static uint8_t g_uart_j_pending = 0;
+static uint8_t g_uart_k_pending = 0;
 static uint8_t g_uart_j_cd = 0;
 static uint8_t g_demo_mode = 0;
 static uint8_t g_demo_restart_wait = 0;
 static uint8_t g_versus_mode = 0;
+static uint8_t g_vs_cpu_mode = 0;
 static uint8_t demo_vis[BOARD_H][BOARD_W];
 static uint8_t demo_first[BOARD_H][BOARD_W];
 static uint16_t demo_qx[BOARD_CELLS];
@@ -225,6 +236,7 @@ static void enter_run_mode(void);
 static void enter_demo_mode(void);
 static void enter_versus_mode(void);
 static void show_menu(uint8_t sel);
+static uint8_t versus_on_snake(const Point *s, uint16_t len, uint8_t x, uint8_t y, uint8_t eating);
 
 static void rng_stir_once(void)
 {
@@ -315,10 +327,10 @@ static void uart_service(void)
     switch (c) {
       case 'w': case 'W':
         if (g_state == GS_RUN && g_input_block_ticks == 0) {
-          if (g_versus_mode) {
+          if (g_versus_mode && !g_vs_cpu_mode) {
             if (dir2_now != DIR_DOWN) dir2_next = DIR_UP;
-          } else if (dir_now != DIR_DOWN) {
-            dir_next = DIR_UP;
+          } else if (!g_versus_mode || g_vs_cpu_mode) {
+            if (dir_now != DIR_DOWN) dir_next = DIR_UP;
           }
         } else {
           g_uart_key = 1;
@@ -326,10 +338,10 @@ static void uart_service(void)
         break;
       case 's': case 'S':
         if (g_state == GS_RUN && g_input_block_ticks == 0) {
-          if (g_versus_mode) {
+          if (g_versus_mode && !g_vs_cpu_mode) {
             if (dir2_now != DIR_UP) dir2_next = DIR_DOWN;
-          } else if (dir_now != DIR_UP) {
-            dir_next = DIR_DOWN;
+          } else if (!g_versus_mode || g_vs_cpu_mode) {
+            if (dir_now != DIR_UP) dir_next = DIR_DOWN;
           }
         } else {
           g_uart_key = 2;
@@ -337,19 +349,19 @@ static void uart_service(void)
         break;
       case 'a': case 'A':
         if (g_state == GS_RUN && g_input_block_ticks == 0) {
-          if (g_versus_mode) {
+          if (g_versus_mode && !g_vs_cpu_mode) {
             if (dir2_now != DIR_RIGHT) dir2_next = DIR_LEFT;
-          } else if (dir_now != DIR_RIGHT) {
-            dir_next = DIR_LEFT;
+          } else if (!g_versus_mode || g_vs_cpu_mode) {
+            if (dir_now != DIR_RIGHT) dir_next = DIR_LEFT;
           }
         }
         break;
       case 'd': case 'D':
         if (g_state == GS_RUN && g_input_block_ticks == 0) {
-          if (g_versus_mode) {
+          if (g_versus_mode && !g_vs_cpu_mode) {
             if (dir2_now != DIR_LEFT) dir2_next = DIR_RIGHT;
-          } else if (dir_now != DIR_LEFT) {
-            dir_next = DIR_RIGHT;
+          } else if (!g_versus_mode || g_vs_cpu_mode) {
+            if (dir_now != DIR_LEFT) dir_next = DIR_RIGHT;
           }
         }
         break;
@@ -359,6 +371,8 @@ static void uart_service(void)
       case 'k': case 'K':
         if (g_state == GS_OVER || g_state == GS_PAUSE) {
           g_uart_key = 3;
+        } else if (g_state == GS_MENU) {
+          g_uart_k_pending = 1;
         }
         break;
       default:
@@ -375,6 +389,13 @@ static uint8_t uart_take_confirm(void)
   return KEY_CONFIRM;
 }
 
+static uint8_t uart_take_enter(void)
+{
+  if (!g_uart_k_pending) return 0;
+  g_uart_k_pending = 0;
+  return KEY_ENTER;
+}
+
 static uint8_t poll_key(void)
 {
   uint8_t k = key_scan_click();
@@ -383,6 +404,9 @@ static uint8_t poll_key(void)
 
   k = g_uart_key;
   g_uart_key = 0;
+  if (k) return k;
+
+  k = uart_take_enter();
   if (k) return k;
 
   return uart_take_confirm();
@@ -439,7 +463,11 @@ static void uart_log_start_solo(uint8_t demo)
 
 static void uart_log_start_vs(void)
 {
-  usart1_send_str("[START] 2P_VS P1=KEYS P2=UART\r\n");
+  if (g_vs_cpu_mode) {
+    usart1_send_str("[START] VS_CPU P1=KEYS CPU=AI\r\n");
+  } else {
+    usart1_send_str("[START] 2P_VS P1=KEYS P2=UART\r\n");
+  }
 }
 
 static void uart_log_score(void)
@@ -493,7 +521,7 @@ static void uart_log_vs_over(VsResult result, VsReason r1, VsReason r2)
 {
   usart1_send_str("[VS_OVER] ");
   if (result == VS_P1_WIN) usart1_send_str("P1_WIN");
-  else if (result == VS_P2_WIN) usart1_send_str("P2_WIN");
+  else if (result == VS_P2_WIN) usart1_send_str(g_vs_cpu_mode ? "CPU_WIN" : "P2_WIN");
   else usart1_send_str("DRAW");
   usart1_send_str(" p1_len=");
   uart_send_uint(snake_len);
@@ -642,7 +670,7 @@ static void draw_menu_footer(void)
   POINT_COLOR = NEON_CYAN;
   LCD_DrawLine(0, FOOT_Y + 1, 239, FOOT_Y + 1);
   Show_Str(8, FOOT_Y + 8, NEON_CYAN, UI_PANEL, (u8*)"K1/K2 or W/S: SELECT", 16, 0);
-  Show_Str(8, FOOT_Y + 28, NEON_PINK, UI_PANEL, (u8*)"K3/K4 or J: CHANGE/OK", 16, 0);
+  Show_Str(8, FOOT_Y + 28, NEON_PINK, UI_PANEL, (u8*)"K3/J: CHANGE  K4/K: START", 16, 0);
 }
 
 static void draw_hud_static(void)
@@ -958,6 +986,205 @@ static void demo_ai_pick_dir(void)
   }
 }
 
+/* ---- Versus CPU AI (P2): BFS food + flood-fill survival ---- */
+static uint8_t vs2_is_reverse(Dir d)
+{
+  if (d == DIR_UP && dir2_now == DIR_DOWN) return 1;
+  if (d == DIR_DOWN && dir2_now == DIR_UP) return 1;
+  if (d == DIR_LEFT && dir2_now == DIR_RIGHT) return 1;
+  if (d == DIR_RIGHT && dir2_now == DIR_LEFT) return 1;
+  return 0;
+}
+
+static uint8_t vs2_move_info(Dir d, uint8_t *nx, uint8_t *ny, uint8_t *will_eat)
+{
+  Point p = snake2[0];
+
+  if (vs2_is_reverse(d)) return 0;
+
+  if (d == DIR_UP) p.y--;
+  else if (d == DIR_DOWN) p.y++;
+  else if (d == DIR_LEFT) p.x--;
+  else p.x++;
+
+  if (p.x >= BOARD_W || p.y >= BOARD_H) return 0;
+
+  *will_eat = (uint8_t)(p.x == food.x && p.y == food.y);
+  if (versus_on_snake(snake2, snake2_len, p.x, p.y, *will_eat)) return 0;
+  if (versus_on_snake(snake, snake_len, p.x, p.y, 0)) return 0;
+
+  *nx = p.x;
+  *ny = p.y;
+  return 1;
+}
+
+static uint8_t vs2_board_blocked(uint8_t x, uint8_t y, uint8_t p2_eating, uint8_t p1_eating)
+{
+  if (x >= BOARD_W || y >= BOARD_H) return 1;
+  if (versus_on_snake(snake2, snake2_len, x, y, p2_eating)) return 1;
+  if (versus_on_snake(snake, snake_len, x, y, p1_eating)) return 1;
+  return 0;
+}
+
+static uint16_t vs2_flood_fill(uint8_t sx, uint8_t sy, uint8_t p2_eating, uint8_t p1_eating)
+{
+  uint16_t head = 0;
+  uint16_t tail = 0;
+  uint16_t count = 0;
+  static const int8_t ddx[4] = {0, 0, -1, 1};
+  static const int8_t ddy[4] = {-1, 1, 0, 0};
+
+  demo_vis_clear();
+  demo_qx[tail] = sx;
+  demo_qy[tail] = sy;
+  tail++;
+  demo_vis[sy][sx] = 1;
+  count = 1;
+
+  while (head < tail) {
+    uint8_t x = demo_qx[head];
+    uint8_t y = demo_qy[head];
+    uint8_t i;
+
+    head++;
+    for (i = 0; i < 4; i++) {
+      int nx = (int)x + ddx[i];
+      int ny = (int)y + ddy[i];
+
+      if (nx < 0 || ny < 0 || nx >= BOARD_W || ny >= BOARD_H) continue;
+      if (demo_vis[ny][nx]) continue;
+      if (vs2_board_blocked((uint8_t)nx, (uint8_t)ny, p2_eating, p1_eating)) continue;
+
+      demo_vis[ny][nx] = 1;
+      demo_qx[tail] = (uint8_t)nx;
+      demo_qy[tail] = (uint8_t)ny;
+      tail++;
+      count++;
+    }
+  }
+
+  return count;
+}
+
+static uint8_t vs2_survives(uint8_t nx, uint8_t ny, uint8_t will_eat)
+{
+  uint16_t space = vs2_flood_fill(nx, ny, will_eat, 0);
+  uint16_t need = snake2_len;
+
+  if (will_eat) need++;
+  return space >= need;
+}
+
+static uint8_t vs2_bfs_food_dir(Dir *out_dir)
+{
+  uint16_t head_q = 0;
+  uint16_t tail_q = 0;
+  uint8_t hx = snake2[0].x;
+  uint8_t hy = snake2[0].y;
+  uint8_t y, x;
+  static const int8_t ddx[4] = {0, 0, -1, 1};
+  static const int8_t ddy[4] = {-1, 1, 0, 0};
+  static const Dir ddir[4] = {DIR_UP, DIR_DOWN, DIR_LEFT, DIR_RIGHT};
+
+  demo_vis_clear();
+  for (y = 0; y < BOARD_H; y++) {
+    for (x = 0; x < BOARD_W; x++) {
+      demo_first[y][x] = 255;
+    }
+  }
+
+  demo_qx[tail_q] = hx;
+  demo_qy[tail_q] = hy;
+  tail_q++;
+  demo_vis[hy][hx] = 1;
+
+  while (head_q < tail_q) {
+    uint8_t cx = demo_qx[head_q];
+    uint8_t cy = demo_qy[head_q];
+    uint8_t fs = demo_first[cy][cx];
+    uint8_t i;
+
+    head_q++;
+    for (i = 0; i < 4; i++) {
+      int nx = (int)cx + ddx[i];
+      int ny = (int)cy + ddy[i];
+      uint8_t nd;
+
+      if (nx < 0 || ny < 0 || nx >= BOARD_W || ny >= BOARD_H) continue;
+      if (demo_vis[ny][nx]) continue;
+      if (versus_on_snake(snake2, snake2_len, (uint8_t)nx, (uint8_t)ny, 0)) continue;
+      if (versus_on_snake(snake, snake_len, (uint8_t)nx, (uint8_t)ny, 0)) continue;
+
+      nd = (cx == hx && cy == hy) ? (uint8_t)ddir[i] : fs;
+      if ((uint8_t)nx == food.x && (uint8_t)ny == food.y) {
+        *out_dir = (Dir)nd;
+        return 1;
+      }
+
+      demo_vis[ny][nx] = 1;
+      demo_first[ny][nx] = nd;
+      demo_qx[tail_q] = (uint8_t)nx;
+      demo_qy[tail_q] = (uint8_t)ny;
+      tail_q++;
+    }
+  }
+
+  return 0;
+}
+
+static uint8_t vs2_try_dir(Dir d)
+{
+  uint8_t nx, ny, eat;
+
+  if (!vs2_move_info(d, &nx, &ny, &eat)) return 0;
+  dir2_next = d;
+  return 1;
+}
+
+static void versus_ai_pick_dir(void)
+{
+  Dir food_dir;
+  Dir best_d = dir2_now;
+  uint8_t nx, ny, eat, i;
+  uint8_t found = 0;
+  uint16_t best_space = 0;
+  int best_dist = 1000;
+
+  if (vs2_bfs_food_dir(&food_dir)) {
+    if (vs2_move_info(food_dir, &nx, &ny, &eat) && vs2_survives(nx, ny, eat)) {
+      dir2_next = food_dir;
+      return;
+    }
+  }
+
+  for (i = 0; i < 4; i++) {
+    Dir d = (Dir)i;
+    uint16_t space;
+    int dist;
+
+    if (!vs2_move_info(d, &nx, &ny, &eat)) continue;
+    if (!vs2_survives(nx, ny, eat)) continue;
+
+    space = vs2_flood_fill(nx, ny, eat, 0);
+    dist = demo_manhattan(nx, ny);
+    if (!found || space > best_space || (space == best_space && dist < best_dist)) {
+      found = 1;
+      best_space = space;
+      best_dist = dist;
+      best_d = d;
+    }
+  }
+
+  if (found) {
+    dir2_next = best_d;
+    return;
+  }
+
+  for (i = 0; i < 4; i++) {
+    if (vs2_try_dir((Dir)i)) return;
+  }
+}
+
 static uint8_t snake2_contains(uint8_t x, uint8_t y)
 {
   uint16_t i;
@@ -996,7 +1223,7 @@ static void draw_hud_versus_static(void)
   POINT_COLOR = NEON_CYAN;
   LCD_DrawLine(0, HUD_H - 1, 239, HUD_H - 1);
   Show_Str(2, 4, NEON_CYAN, UI_PANEL, (u8*)"P1", 16, 0);
-  Show_Str(118, 4, NEON_PINK, UI_PANEL, (u8*)"P2", 16, 0);
+  Show_Str(118, 4, NEON_PINK, UI_PANEL, g_vs_cpu_mode ? (u8*)"CPU" : (u8*)"P2", 16, 0);
 }
 
 static void update_hud_versus(void)
@@ -1106,10 +1333,11 @@ static void versus_over_screen(VsResult result, VsReason r1, VsReason r2)
 
   if (result == VS_P1_WIN) {
     Show_Str(52, 88, NEON_CYAN, UI_PANEL, (u8*)"P1 WINS!", 24, 0);
-    Show_Str(24, 124, NEON_MUTED, UI_PANEL, (u8*)"P2", 16, 0);
+    Show_Str(24, 124, NEON_MUTED, UI_PANEL, g_vs_cpu_mode ? (u8*)"CPU" : (u8*)"P2", 16, 0);
     Show_Str(56, 124, NEON_PINK, UI_PANEL, (u8*)vs_reason_str(r2), 16, 0);
   } else if (result == VS_P2_WIN) {
-    Show_Str(52, 88, NEON_PINK, UI_PANEL, (u8*)"P2 WINS!", 24, 0);
+    Show_Str(52, 88, NEON_PINK, UI_PANEL,
+             g_vs_cpu_mode ? (u8*)"CPU WINS!" : (u8*)"P2 WINS!", 24, 0);
     Show_Str(24, 124, NEON_MUTED, UI_PANEL, (u8*)"P1", 16, 0);
     Show_Str(56, 124, NEON_CYAN, UI_PANEL, (u8*)vs_reason_str(r1), 16, 0);
   } else {
@@ -1119,7 +1347,11 @@ static void versus_over_screen(VsResult result, VsReason r1, VsReason r2)
 
   draw_stat_line(148, (u8*)"P1 LEN", snake_len, 3);
   draw_stat_line(168, (u8*)"P2 LEN", snake2_len, 3);
-  Show_Str(20, 200, NEON_MUTED, UI_PANEL, (u8*)"P1:K1-K4  P2:WASD", 16, 0);
+  if (g_vs_cpu_mode) {
+    Show_Str(20, 200, NEON_MUTED, UI_PANEL, (u8*)"P1:K1-K4/WASD CPU:AI", 16, 0);
+  } else {
+    Show_Str(20, 200, NEON_MUTED, UI_PANEL, (u8*)"P1:K1-K4  P2:WASD", 16, 0);
+  }
   Show_Str(20, 228, NEON_CYAN, UI_PANEL, (u8*)"J:RETRY  K3/K:MENU", 16, 0);
   uart_log_vs_over(result, r1, r2);
 }
@@ -1359,7 +1591,7 @@ static void sfx_play_gameover(void)
 
 static void play_bgm_step(void)
 {
-  if (!g_music_on || g_state != GS_RUN || g_demo_mode || g_versus_mode) {
+  if (!g_music_on || g_state != GS_RUN || g_demo_mode) {
     bgm_stop();
     return;
   }
@@ -1424,7 +1656,11 @@ static void show_pause_dialog(void)
   if (g_versus_mode) {
     draw_stat_line(126, (u8*)"P1 LEN", snake_len, 3);
     draw_stat_line(146, (u8*)"P2 LEN", snake2_len, 3);
-    Show_Str(20, 176, NEON_MUTED, UI_PANEL, (u8*)"P1:K1-K4 P2:WASD", 16, 0);
+    if (g_vs_cpu_mode) {
+      Show_Str(20, 176, NEON_MUTED, UI_PANEL, (u8*)"P1:K1-K4/WASD CPU:AI", 16, 0);
+    } else {
+      Show_Str(20, 176, NEON_MUTED, UI_PANEL, (u8*)"P1:K1-K4 P2:WASD", 16, 0);
+    }
   } else {
     draw_stat_line(126, (u8*)"SCORE", g_score, 4);
     draw_stat_line(146, (u8*)"LEVEL", g_level, 2);
@@ -1455,7 +1691,7 @@ static void pause_resume(void)
   g_input_block_ticks = 20;
   if (g_versus_mode) versus_redraw_view();
   else snake_redraw_view();
-  if (g_music_on && !g_demo_mode && !g_versus_mode) bgm_play_note(Mario_Full[g_bgm_idx]);
+  if (g_music_on && !g_demo_mode) bgm_play_note(Mario_Full[g_bgm_idx]);
 }
 
 static void snake_step(void)
@@ -1521,31 +1757,54 @@ static void snake_step(void)
   }
 }
 
+static uint8_t key_raw_read(void)
+{
+  if (KEY_UP_PRESSED()) return 1;
+  if (KEY_DOWN_PRESSED()) return 2;
+  if (KEY_LEFT_PRESSED()) return 3;
+  if (KEY_RIGHT_PRESSED()) return 4;
+  return 0;
+}
+
 static uint8_t key_scan_click(void)
 {
-  uint8_t k = 0;
-  if (KEY_UP_PRESSED()) k = 1;
-  else if (KEY_DOWN_PRESSED()) k = 2;
-  else if (KEY_LEFT_PRESSED()) k = 3;
-  else if (KEY_RIGHT_PRESSED()) k = 4;
+  uint8_t k;
+  uint8_t k2;
 
-  if (k && !g_key_click_lock) {
-    Delay_ms(12);
-    g_key_click_lock = 1;
-    return k;
+  if (g_key_cooldown_ticks > 0) return 0;
+
+  k = key_raw_read();
+  if (!k) {
+    g_key_click_lock = 0;
+    return 0;
   }
-  if (!k) g_key_click_lock = 0;
-  return 0;
+
+  if (g_key_click_lock) return 0;
+
+  Delay_ms(KEY_DEBOUNCE_MS);
+  k2 = key_raw_read();
+  if (k2 != k) return 0;
+
+  g_key_click_lock = 1;
+  g_key_cooldown_ticks = KEY_COOLDOWN_TICKS;
+  return k2;
 }
 
 static void key_wait_release(void)
 {
-  while (KEY_UP_PRESSED() || KEY_DOWN_PRESSED() ||
-         KEY_LEFT_PRESSED() || KEY_RIGHT_PRESSED()) {
+  uint8_t idle = 0;
+
+  while (idle < KEY_RELEASE_STABLE) {
+    if (key_raw_read()) {
+      idle = 0;
+    } else {
+      idle++;
+    }
     rng_stir_once();
-    Delay_ms(10);
+    Delay_ms(KEY_RELEASE_MS);
   }
   g_key_click_lock = 0;
+  g_key_cooldown_ticks = KEY_COOLDOWN_TICKS;
 }
 
 static void key4_reset_hold(void)
@@ -1563,7 +1822,7 @@ static uint8_t key4_long_pressed(void)
 
   if (KEY_RIGHT_PRESSED()) {
     if (g_key4_hold_ticks < 255) g_key4_hold_ticks++;
-    if (g_key4_hold_ticks >= 25) {
+    if (g_key4_hold_ticks >= KEY4_LONG_TICKS) {
       g_key4_hold_ticks = 0;
       return 1;
     }
@@ -1643,9 +1902,16 @@ static void enter_versus_mode(void)
   bgm_reset();
   versus_reset();
 
-  Show_Str(36, 120, NEON_CYAN, UI_BG, (u8*)"2P FIGHT!", 32, 0);
+  if (g_vs_cpu_mode) {
+    Show_Str(36, 120, NEON_LIME, UI_BG, (u8*)"VS CPU!", 32, 0);
+  } else {
+    Show_Str(36, 120, NEON_CYAN, UI_BG, (u8*)"2P FIGHT!", 32, 0);
+  }
   Delay_ms(700);
   versus_redraw_view();
+  if (g_music_on) {
+    bgm_play_note(Mario_Full[0]);
+  }
   uart_log_start_vs();
 }
 
@@ -1654,12 +1920,12 @@ static void show_boot(void)
   LCD_Clear(NEON_VOID);
   draw_neon_scanlines(0, 319);
   draw_dialog_frame(10, 55, 230, 235);
-  Show_Str(30, 68, NEON_CYAN, UI_PANEL, (u8*)"CYBER", 32, 0);
-  Show_Str(118, 68, NEON_MAG, UI_PANEL, (u8*)"SNAKE", 32, 0);
-  Show_Str(38, 118, NEON_PINK, UI_PANEL, (u8*)"NUAA CM3-107", 16, 0);
-  Show_Str(24, 142, NEON_MUTED, UI_PANEL, (u8*)"K1-K4 / UART WASDJ", 16, 0);
-  Show_Str(24, 164, NEON_MUTED, UI_PANEL, (u8*)"WASD MOVE  J OK/PAUSE", 16, 0);
-  Show_Str(30, 200, NEON_YELLOW, UI_PANEL, (u8*)"PRESS ANY KEY", 16, 0);
+  Show_Str(80, 68, NEON_CYAN, UI_PANEL, (u8*)"赛博", 16, 0);
+  Show_Str(118, 68, NEON_MAG, UI_PANEL, (u8*)"贪吃蛇", 16, 0);
+  Show_Str(38, 118, NEON_PINK, UI_PANEL, (u8*)"NUAA -23", 16, 0);
+  Show_Str(24, 142, NEON_MUTED, UI_PANEL, (u8*)"K1-K4 / UART WASDJK", 16, 0);
+  Show_Str(24, 164, NEON_MUTED, UI_PANEL, (u8*)"WASD 移动 J 确认/修改", 16, 0);
+  Show_Str(30, 200, NEON_YELLOW, UI_PANEL, (u8*)"按任意键开始...", 16, 0);
 }
 
 static void menu_draw_item(uint8_t idx, uint8_t selected)
@@ -1668,55 +1934,37 @@ static void menu_draw_item(uint8_t idx, uint8_t selected)
   uint16_t bg = selected ? NEON_SEL_BG : UI_PANEL;
   uint16_t fg = selected ? NEON_SEL_FG : NEON_YELLOW;
   const u8 *labels[5] = {
-    (u8*)"> START",
-    (u8*)"> DIFFICULTY",
-    (u8*)"> MUSIC",
-    (u8*)"> DEMO",
-    (u8*)"> 2P VS"
+    (u8*)"> 开始",
+    (u8*)"> 难度选择",
+    (u8*)"> 音乐",
+    (u8*)"> 人机演示",
+    (u8*)"> 对战"
   };
 
   if (idx >= MENU_ITEM_CNT) return;
 
-  LCD_Fill(20, y - 2, 158, y + 16, bg);
+  LCD_Fill(20, y - 2, 224, y + 16, bg);
   if (selected) {
     LCD_Fill(20, y - 2, 23, y + 16, NEON_CYAN);
   }
   Show_Str(30, y, fg, bg, (u8*)labels[idx], 16, 0);
-}
 
-static void menu_draw_diff_value(void)
-{
-  LCD_Fill(165, 83, 230, 99, UI_PANEL);
-  if (g_diff == DIF_EASY) Show_Str(170, 85, NEON_LIME, UI_PANEL, (u8*)"EASY", 16, 0);
-  else if (g_diff == DIF_NORMAL) Show_Str(170, 85, NEON_CYAN, UI_PANEL, (u8*)"NORMAL", 16, 0);
-  else Show_Str(170, 85, NEON_MAG, UI_PANEL, (u8*)"HARD", 16, 0);
-}
-
-static void menu_draw_music_value(void)
-{
-  LCD_Fill(165, 102, 230, 118, UI_PANEL);
-  Show_Str(170, 104, g_music_on ? NEON_CYAN : NEON_MUTED, UI_PANEL,
-           g_music_on ? (u8*)"ON" : (u8*)"OFF", 16, 0);
-}
-
-static void menu_draw_demo_value(void)
-{
-  LCD_Fill(165, 121, 230, 137, UI_PANEL);
-  Show_Str(170, 123, NEON_PINK, UI_PANEL, (u8*)"AUTO", 16, 0);
-}
-
-static void menu_draw_vs_value(void)
-{
-  LCD_Fill(165, 140, 230, 156, UI_PANEL);
-  Show_Str(170, 142, NEON_MAG, UI_PANEL, (u8*)"P1+P2", 16, 0);
-}
-
-static void menu_redraw_value(uint8_t idx)
-{
-  if (idx == 1) menu_draw_diff_value();
-  else if (idx == 2) menu_draw_music_value();
-  else if (idx == 3) menu_draw_demo_value();
-  else if (idx == 4) menu_draw_vs_value();
+  if (idx == 1) {
+    if (g_diff == DIF_EASY) Show_Str(170, y, NEON_LIME, bg, (u8*)"简单", 16, 0);
+    else if (g_diff == DIF_NORMAL) Show_Str(170, y, NEON_CYAN, bg, (u8*)"普通", 16, 0);
+    else Show_Str(170, y, NEON_MAG, bg, (u8*)"困难", 16, 0);
+  } else if (idx == 2) {
+    Show_Str(170, y, g_music_on ? NEON_CYAN : NEON_MUTED, bg,
+             g_music_on ? (u8*)"开" : (u8*)"关", 16, 0);
+  } else if (idx == 3) {
+    Show_Str(170, y, NEON_PINK, bg, (u8*)"AUTO", 16, 0);
+  } else if (idx == 4) {
+    if (g_vs_cpu_mode) {
+      Show_Str(170, y, NEON_LIME, bg, (u8*)"VS电脑", 16, 0);
+    } else {
+      Show_Str(170, y, NEON_MAG, bg, (u8*)"2P", 16, 0);
+    }
+  }
 }
 
 static void menu_draw_best_value(void)
@@ -1724,14 +1972,14 @@ static void menu_draw_best_value(void)
   BACK_COLOR = UI_PANEL;
   POINT_COLOR = NEON_YELLOW;
   LCD_Fill(30, 165, 120, 181, UI_PANEL);
-  Show_Str(30, 165, NEON_MAG, UI_PANEL, (u8*)"BEST", 16, 0);
+  Show_Str(30, 165, NEON_MAG, UI_PANEL, (u8*)"最好", 16, 0);
   LCD_ShowNum(80, 165, g_best, 4, 16);
 }
 
 static void menu_draw_pot_volume(void)
 {
   LCD_Fill(125, 165, 215, 181, UI_PANEL);
-  Show_Str(125, 165, NEON_CYAN, UI_PANEL, (u8*)"VOL", 16, 0);
+  Show_Str(125, 165, NEON_CYAN, UI_PANEL, (u8*)"音量", 16, 0);
   POINT_COLOR = NEON_YELLOW;
   BACK_COLOR = UI_PANEL;
   LCD_ShowNum(160, 165, g_audio_vol, 3, 16);
@@ -1743,7 +1991,7 @@ static void show_menu_init(uint8_t sel)
   LCD_Clear(NEON_VOID);
   draw_neon_scanlines(0, 54);
 
-  Show_Str(24, 20, NEON_CYAN, NEON_VOID, (u8*)"CYBER MENU", 16, 0);
+  Show_Str(24, 20, NEON_CYAN, NEON_VOID, (u8*)"赛博 菜单", 16, 0);
   Show_Str(168, 20, NEON_MAG, NEON_VOID, (u8*)"2077", 16, 0);
 
   LCD_Fill(15, 55, 225, 198, UI_PANEL);
@@ -1758,10 +2006,6 @@ static void show_menu_init(uint8_t sel)
   menu_draw_item(2, sel == 2);
   menu_draw_item(3, sel == 3);
   menu_draw_item(4, sel == 4);
-  menu_draw_diff_value();
-  menu_draw_music_value();
-  menu_draw_demo_value();
-  menu_draw_vs_value();
   menu_draw_best_value();
   menu_draw_pot_volume();
   draw_menu_footer();
@@ -1771,8 +2015,6 @@ static void menu_update_selection(uint8_t old_sel, uint8_t new_sel)
 {
   if (old_sel < MENU_ITEM_CNT) menu_draw_item(old_sel, 0);
   if (new_sel < MENU_ITEM_CNT) menu_draw_item(new_sel, 1);
-  menu_redraw_value(old_sel);
-  menu_redraw_value(new_sel);
 }
 
 static void menu_leave(void)
@@ -1800,8 +2042,8 @@ int main(void)
   audio_hw_init();
   bgm_stop();
   save_load_best();
-  usart1_send_str("Snake ready. WASD=move, J=OK/pause, 115200\r\n");
-  usart1_send_str("2P VS: menu item 5, P1=K1-K4(green) P2=WASD(blue)\r\n");
+  usart1_send_str("Snake ready. WASD=移动, J=确认/修改, 115200\r\n");
+  usart1_send_str("Menu: J/K3=修改 难度/音乐/模式  K/K4=确认\r\n");
   usart1_send_str("UART OUT: [START] [SCORE] [LEVEL] [OVER] [VS_OVER]\r\n");
   usart1_send_str("POT on PA3/ADC3 = audio volume 0-100%\r\n");
 
@@ -1816,6 +2058,7 @@ int main(void)
       }
     }
     if (g_uart_j_cd > 0) g_uart_j_cd--;
+    if (g_key_cooldown_ticks > 0) g_key_cooldown_ticks--;
     uart_service();
     key = poll_key();
 
@@ -1824,36 +2067,39 @@ int main(void)
         g_state = GS_MENU;
         show_menu(menu_sel);
       }
+      Delay_ms(25);
     }
     else if (g_state == GS_MENU) {
-      uint8_t act = key;
-      if (act == KEY_CONFIRM) act = 4;
-
-      if (act == 1) {
+      if (key == 1) {
         uint8_t old_sel = menu_sel;
         menu_sel = (uint8_t)((menu_sel + MENU_ITEM_CNT - 1) % MENU_ITEM_CNT);
         menu_update_selection(old_sel, menu_sel);
-      } else if (act == 2) {
+      } else if (key == 2) {
         uint8_t old_sel = menu_sel;
         menu_sel = (uint8_t)((menu_sel + 1) % MENU_ITEM_CNT);
         menu_update_selection(old_sel, menu_sel);
-      } else if (act == 3 || act == 4) {
-        if (menu_sel == 0 && act == 4) {
-          enter_run_mode();
-        } else if (menu_sel == 1) {
-          if (act == 4) g_diff = (Difficulty)((g_diff + 1) % 3);
-          else g_diff = (Difficulty)((g_diff + 2) % 3);
-          menu_draw_diff_value();
+      } else if (key == KEY_CONFIRM || key == 3) {
+        if (menu_sel == 1) {
+          g_diff = (Difficulty)((g_diff + 1) % 3);
+          menu_draw_item(menu_sel, 1);
         } else if (menu_sel == 2) {
           g_music_on = !g_music_on;
           if (!g_music_on) bgm_stop();
-          menu_draw_music_value();
-        } else if (menu_sel == 3 && act == 4) {
+          menu_draw_item(menu_sel, 1);
+        } else if (menu_sel == 4) {
+          g_vs_cpu_mode = !g_vs_cpu_mode;
+          menu_draw_item(menu_sel, 1);
+        }
+      } else if (key == KEY_ENTER || key == 4) {
+        if (menu_sel == 0) {
+          enter_run_mode();
+        } else if (menu_sel == 3) {
           enter_demo_mode();
-        } else if (menu_sel == 4 && act == 4) {
+        } else if (menu_sel == 4) {
           enter_versus_mode();
         }
       }
+      Delay_ms(25);
     }
     else if (g_state == GS_RUN) {
       uint8_t key4_hold = key4_long_pressed();
@@ -1883,8 +2129,14 @@ int main(void)
       tick_cnt++;
       if (tick_cnt >= move_interval_ticks) {
         tick_cnt = 0;
-        if (g_versus_mode) versus_step();
-        else snake_step();
+        if (g_versus_mode) {
+          if (g_vs_cpu_mode) {
+            versus_ai_pick_dir();
+          }
+          versus_step();
+        } else {
+          snake_step();
+        }
       }
 
       g_anim_tick++;
