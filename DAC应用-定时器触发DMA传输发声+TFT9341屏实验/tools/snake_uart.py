@@ -20,7 +20,7 @@ def main():
     port = sys.argv[1] if len(sys.argv) > 1 else "COM3"
     ser = serial.Serial(port, 115200, timeout=0.01)
     print("Connected %s @ 115200" % port)
-    print("WASD = move, J = OK/pause/retry, K = menu (game over). Ctrl+C to quit.")
+    print("WASD = move, J = OK/pause/retry, K = menu (pause/game over). Ctrl+C to quit.")
     print("2P VS: board K1-K4 = P1 (green), UART WASD = P2 (blue).")
     print("Board also prints: [START] [SCORE] [LEVEL] [OVER] [VS_OVER] [DEMO_OVER]")
     try:

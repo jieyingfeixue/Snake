@@ -87,11 +87,11 @@ static const uint16_t Mario_Full[] = {
 
   /* 33-48: main theme A-2 */
   784,   659*2, 0,     784*2, 880*2, 0,     698*2, 784*2,
-  0,     659*2, 0,     523*2, 587*2, 988,   0,     0,
+  0,     659*2, 0,     523*2, 587*2, 988,   0,
 
-  /* 49-64: main theme B-1 */
-  0,     0,     659,   0,     0,     880,   0,     988,
-  0,     932,   880,   0,     784,   659*2, 0,     784*2,
+  /* 49-64: main theme B-1 (la-sol-mi) */
+  0,     0,     659,   0,     0,     880,   0,     880,
+  0,     932,   988,   0,     880,   784,   0,     659,
 
   /* 65-80: main theme B-2 */
   880*2, 0,     523*4, 587*4, 0,     988*2, 0,     0,
@@ -122,6 +122,32 @@ static const uint16_t Adventure_Die[] = {
 };
 #define AdventureDieLen (sizeof(Adventure_Die) / sizeof(Adventure_Die[0]))
 #define ADVENTURE_DIE_MS  80
+
+static uint8_t g_audio_vol = 80;
+
+static void audio_rebuild_wavetable(void)
+{
+  uint8_t i;
+  uint32_t s;
+
+  for (i = 0; i < 32; i++) {
+    s = ((uint32_t)Sine12bit[i] * g_audio_vol) / 100u;
+    DAC2Sine12bit[i] = (s << 16) | s;
+  }
+}
+
+static uint8_t audio_volume_service(void)
+{
+  uint8_t vol;
+
+  vol = pot_read_volume_pct();
+  if (vol != g_audio_vol) {
+    g_audio_vol = vol;
+    audio_rebuild_wavetable();
+    return 1;
+  }
+  return 0;
+}
 
 static uint8_t g_bgm_idx = 0;
 static uint8_t g_bgm_tick = 0;
@@ -331,7 +357,7 @@ static void uart_service(void)
         g_uart_j_pending = 1;
         break;
       case 'k': case 'K':
-        if (g_state == GS_OVER) {
+        if (g_state == GS_OVER || g_state == GS_PAUSE) {
           g_uart_key = 3;
         }
         break;
@@ -1295,12 +1321,8 @@ static void bgm_play_note(uint16_t freq)
 
 static void audio_hw_init(void)
 {
-  uint8_t i;
-
-  for (i = 0; i < 32; i++) {
-    DAC2Sine12bit[i] = (Sine12bit[i] << 16) + Sine12bit[i];
-  }
-
+  g_audio_vol = pot_read_volume_pct();
+  audio_rebuild_wavetable();
   DMA_Configuration();
   TIM_Configuration(Mario_Full[0]);
   DAC_Configuration();
@@ -1412,7 +1434,7 @@ static void show_pause_dialog(void)
   }
 
   Show_Str(20, 210, NEON_CYAN, UI_PANEL, (u8*)"J / K4HOLD: CONTINUE", 16, 0);
-  Show_Str(20, 232, NEON_PINK, UI_PANEL, (u8*)"K3: BACK TO MENU", 16, 0);
+  Show_Str(20, 232, NEON_PINK, UI_PANEL, (u8*)"K3/K: BACK TO MENU", 16, 0);
   g_pause_drawn = 1;
 }
 
@@ -1706,6 +1728,16 @@ static void menu_draw_best_value(void)
   LCD_ShowNum(80, 165, g_best, 4, 16);
 }
 
+static void menu_draw_pot_volume(void)
+{
+  LCD_Fill(125, 165, 215, 181, UI_PANEL);
+  Show_Str(125, 165, NEON_CYAN, UI_PANEL, (u8*)"VOL", 16, 0);
+  POINT_COLOR = NEON_YELLOW;
+  BACK_COLOR = UI_PANEL;
+  LCD_ShowNum(160, 165, g_audio_vol, 3, 16);
+  Show_Str(190, 165, NEON_MUTED, UI_PANEL, (u8*)"%", 16, 0);
+}
+
 static void show_menu_init(uint8_t sel)
 {
   LCD_Clear(NEON_VOID);
@@ -1731,6 +1763,7 @@ static void show_menu_init(uint8_t sel)
   menu_draw_demo_value();
   menu_draw_vs_value();
   menu_draw_best_value();
+  menu_draw_pot_volume();
   draw_menu_footer();
 }
 
@@ -1759,6 +1792,8 @@ int main(void)
   SystemInit();
   Delay_Init();
   GPIO_Configuration();
+  ADC_Mode_Config();
+  Delay_ms(20);
   USART1_Configuration();
   DAC_Configuration();
   LCD_Init();
@@ -1768,12 +1803,18 @@ int main(void)
   usart1_send_str("Snake ready. WASD=move, J=OK/pause, 115200\r\n");
   usart1_send_str("2P VS: menu item 5, P1=K1-K4(green) P2=WASD(blue)\r\n");
   usart1_send_str("UART OUT: [START] [SCORE] [LEVEL] [OVER] [VS_OVER]\r\n");
+  usart1_send_str("POT on PA3/ADC3 = audio volume 0-100%\r\n");
 
   g_state = GS_BOOT;
   show_boot();
 
   while (1) {
     rng_stir_once();
+    if (audio_volume_service()) {
+      if (g_state == GS_MENU) {
+        menu_draw_pot_volume();
+      }
+    }
     if (g_uart_j_cd > 0) g_uart_j_cd--;
     uart_service();
     key = poll_key();

@@ -93,6 +93,7 @@ int filter_YDPJ(void);
 int filter_JQPJ(void);
 int filter_DT(void);
 void ADC_Mode_Config(void);
+uint8_t pot_read_volume_pct(void);
 int ReadADCAverageValue(uint16_t Channel);
 int ReadADCQJZQPJValue(u16 Channel);
 int filter_DTLB(void);
